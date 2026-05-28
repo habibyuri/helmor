@@ -123,13 +123,15 @@ pub fn upsert_setting_json<T: Serialize>(key: &str, value: &T) -> Result<()> {
 const AUTO_CLOSE_ACTION_KINDS_KEY: &str = "auto_close_action_kinds";
 const AUTO_CLOSE_OPT_IN_ASKED_KEY: &str = "auto_close_opt_in_asked";
 
-/// Account-global rate-limit snapshots: the raw upstream response body
-/// is stored verbatim (no shape mapping) by the corresponding
+/// Rate-limit snapshot settings: the raw upstream response body is
+/// stored verbatim (no shape mapping) by the corresponding
 /// `get_*_rate_limits` Tauri command after a live OAuth fetch, and read
 /// back by the same command as the cache-fallback when a fresh fetch
-/// fails. The frontend's `parse{Codex,Claude}RateLimits` does the
-/// shape work, so a schema change at the provider only needs a parser
-/// tweak — not a DB migration.
+/// fails. Codex appends a selected-home hash to this prefix so wrappers
+/// with different `CODEX_HOME` values do not share cached quota state.
+/// The frontend's `parse{Codex,Claude}RateLimits` does the shape work,
+/// so a schema change at the provider only needs a parser tweak — not a
+/// DB migration.
 pub const CODEX_RATE_LIMITS_KEY: &str = "app.codex_rate_limits";
 pub const CLAUDE_RATE_LIMITS_KEY: &str = "app.claude_rate_limits";
 

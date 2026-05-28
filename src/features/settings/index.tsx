@@ -66,6 +66,7 @@ import { SettingsSelect } from "./components/settings-select";
 import { AccountPanel } from "./panels/account";
 import { AppUpdatesPanel } from "./panels/app-updates";
 import { AppearancePanel } from "./panels/appearance";
+import { CodexBinarySettingsRow } from "./panels/codex-binary";
 import { ComponentsPanel } from "./panels/components";
 import { ConductorImportPanel } from "./panels/conductor-import";
 import { CursorProviderPanel } from "./panels/cursor-provider";
@@ -581,6 +582,12 @@ export const SettingsDialog = memo(function SettingsDialog({
 												patch.prFastMode = p.fastMode;
 											void updateSettings(patch);
 										}}
+									/>
+									<CodexBinarySettingsRow
+										value={settings.codexExecutablePath}
+										onChange={(codexExecutablePath) =>
+											updateSettings({ codexExecutablePath })
+										}
 									/>
 									<ClaudeCustomProvidersPanel />
 									<CursorProviderPanel />

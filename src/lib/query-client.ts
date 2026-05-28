@@ -49,6 +49,7 @@ import {
 	getSessionThreadPaginationState,
 	setSessionThreadPaginationState,
 } from "./session-thread-pagination";
+import type { AppSettings } from "./settings";
 
 const SESSION_STALE_TIME = 10 * 60_000;
 const CHANGES_STALE_TIME = 3_000;
@@ -58,11 +59,34 @@ const DEFAULT_GC_TIME = 30 * 60_000;
 const SESSION_GC_TIME = 60 * 60_000;
 const PERSIST_GC_TIME = 24 * 60 * 60_000; // 24h — persisted entries live this long
 
+export type CodexRuntimeScope = {
+	executablePath: string;
+	querySegment: string;
+};
+
+export function codexRuntimeScope(
+	settings: Pick<AppSettings, "codexExecutablePath">,
+): CodexRuntimeScope {
+	const executablePath = settings.codexExecutablePath;
+	return {
+		executablePath,
+		querySegment: executablePath.trim(),
+	};
+}
+
+export function agentRuntimeQuerySegment(
+	provider: AgentProvider,
+	settings: Pick<AppSettings, "codexExecutablePath">,
+): string {
+	return provider === "codex" ? codexRuntimeScope(settings).querySegment : "";
+}
+
 export const helmorQueryKeys = {
 	workspaceGroups: ["workspaceGroups"] as const,
 	archivedWorkspaces: ["archivedWorkspaces"] as const,
 	repositories: ["repositories"] as const,
 	agentModelSections: ["agentModelSections"] as const,
+	agentLoginStatus: ["agentLoginStatus"] as const,
 	workspaceDetail: (workspaceId: string) =>
 		["workspaceDetail", workspaceId] as const,
 	workspaceSessions: (workspaceId: string) =>
@@ -71,7 +95,8 @@ export const helmorQueryKeys = {
 		["sessionContextUsage", sessionId] as const,
 	sessionCodexGoal: (sessionId: string) =>
 		["sessionCodexGoal", sessionId] as const,
-	codexRateLimits: ["codexRateLimits"] as const,
+	codexRateLimits: (codexExecutablePath: string) =>
+		["codexRateLimits", codexExecutablePath.trim()] as const,
 	claudeRateLimits: ["claudeRateLimits"] as const,
 	claudeRichContextUsage: (
 		sessionId: string,
@@ -133,6 +158,7 @@ export const helmorQueryKeys = {
 		workingDirectory: string | null,
 		workspaceId: string | null,
 		repoId: string | null,
+		codexExecutablePath = "",
 	) =>
 		[
 			"slashCommands",
@@ -140,6 +166,7 @@ export const helmorQueryKeys = {
 			workingDirectory ?? "",
 			workspaceId ?? "",
 			repoId ?? "",
+			provider === "codex" ? codexExecutablePath.trim() : "",
 		] as const,
 	workspaceLinkedDirectories: (workspaceId: string) =>
 		["workspaceLinkedDirectories", workspaceId] as const,
@@ -540,10 +567,13 @@ const RATE_LIMITS_STALE_TIME = 2 * 60_000;
 // 2 min interval + window-focus refetch + hover refetch. The Rust
 // command's 30 s throttle is the hard ceiling — extra triggers just
 // hit the cached body, so we can be eager here.
-export function codexRateLimitsQueryOptions(enabled: boolean) {
+export function codexRateLimitsQueryOptions(
+	enabled: boolean,
+	codexExecutablePath: string,
+) {
 	return queryOptions({
-		queryKey: helmorQueryKeys.codexRateLimits,
-		queryFn: getCodexRateLimits,
+		queryKey: helmorQueryKeys.codexRateLimits(codexExecutablePath),
+		queryFn: () => getCodexRateLimits(codexExecutablePath),
 		staleTime: RATE_LIMITS_STALE_TIME,
 		refetchInterval: enabled ? RATE_LIMITS_STALE_TIME : false,
 		refetchOnWindowFocus: true,
@@ -729,6 +759,7 @@ export function slashCommandsQueryOptions(
 	workingDirectory: string | null,
 	repoId: string | null,
 	workspaceId: string | null,
+	codexExecutablePath = "",
 ) {
 	return queryOptions({
 		queryKey: helmorQueryKeys.slashCommands(
@@ -736,6 +767,7 @@ export function slashCommandsQueryOptions(
 			workingDirectory,
 			workspaceId,
 			repoId,
+			codexExecutablePath,
 		),
 		queryFn: () =>
 			listSlashCommands({

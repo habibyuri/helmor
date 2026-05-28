@@ -10,11 +10,17 @@ export type EnableGoalsResult =
 	| { kind: "alreadyEnabled"; path: string }
 	| { kind: "modified"; path: string };
 
-export function codexConfigPath(): string {
+export function codexConfigPath(codexHome?: string | null): string {
+	return codexConfigPathForHome(codexHome ?? defaultCodexHome());
+}
+
+export function codexConfigPathForHome(codexHome: string): string {
+	return join(codexHome, "config.toml");
+}
+
+function defaultCodexHome(): string {
 	const override = process.env.CODEX_HOME?.trim();
-	const home =
-		override && override.length > 0 ? override : join(homedir(), ".codex");
-	return join(home, "config.toml");
+	return override && override.length > 0 ? override : join(homedir(), ".codex");
 }
 
 export async function ensureCodexGoalsFeatureEnabled(

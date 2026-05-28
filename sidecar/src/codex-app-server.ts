@@ -52,6 +52,7 @@ export type OnError = (error: Error) => void;
 export interface CodexAppServerOptions {
 	binaryPath: string;
 	cwd: string;
+	env?: Record<string, string>;
 	onNotification: OnNotification;
 	onRequest: OnRequest;
 	onExit: OnExit;
@@ -89,8 +90,11 @@ export function buildCodexAppServerArgs(): string[] {
  *   - staged (release):    dist/vendor/codex/codex
  *                          dist/vendor/codex/path/rg              ← own sibling
  */
-function buildCodexEnv(binaryPath: string): NodeJS.ProcessEnv {
-	const env = { ...process.env };
+function buildCodexEnv(
+	binaryPath: string,
+	overrides: Record<string, string> = {},
+): NodeJS.ProcessEnv {
+	const env = { ...process.env, ...overrides };
 	const candidates = [
 		join(dirname(binaryPath), "..", "path"),
 		join(dirname(binaryPath), "path"),
@@ -122,7 +126,7 @@ export class CodexAppServer {
 		this.child = spawn(opts.binaryPath, buildCodexAppServerArgs(), {
 			cwd: opts.cwd,
 			stdio: ["pipe", "pipe", "pipe"],
-			env: buildCodexEnv(opts.binaryPath),
+			env: buildCodexEnv(opts.binaryPath, opts.env),
 		});
 
 		this.output = readline.createInterface({ input: this.child.stdout });

@@ -9,7 +9,7 @@
 //!    share the same `~/.claude/skills/` and `.claude/commands/`, so we can
 //!    show stale-but-plausible commands while the real scan runs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
 
 use super::queries::SlashCommandEntry;
@@ -36,8 +36,22 @@ pub fn repo_key(provider: &str, repo_id: &str) -> RepoKey {
 pub struct SlashCommandCache {
     workspaces: RwLock<HashMap<WorkspaceKey, Vec<SlashCommandEntry>>>,
     repos: RwLock<HashMap<RepoKey, Vec<SlashCommandEntry>>>,
+    refresh: Mutex<RefreshState>,
+}
+
+#[derive(Default)]
+struct RefreshState {
     /// Prevents duplicate background refreshes for the same workspace key.
-    refreshing: Mutex<HashSet<WorkspaceKey>>,
+    in_flight: HashMap<WorkspaceKey, u64>,
+    /// Bumped when a provider's external command context changes, so stale
+    /// in-flight refreshes cannot repopulate caches after a clear.
+    generations: HashMap<String, u64>,
+}
+
+impl RefreshState {
+    fn generation(&self, provider: &str) -> u64 {
+        self.generations.get(provider).copied().unwrap_or_default()
+    }
 }
 
 impl Default for SlashCommandCache {
@@ -51,7 +65,7 @@ impl SlashCommandCache {
         Self {
             workspaces: RwLock::new(HashMap::new()),
             repos: RwLock::new(HashMap::new()),
-            refreshing: Mutex::new(HashSet::new()),
+            refresh: Mutex::new(RefreshState::default()),
         }
     }
 
@@ -91,6 +105,23 @@ impl SlashCommandCache {
         repo_id: Option<&str>,
         commands: Vec<SlashCommandEntry>,
     ) {
+        let generation = self.provider_generation(&workspace_key.0);
+        let _ = self.set_if_generation(workspace_key, repo_id, commands, generation);
+    }
+
+    pub fn set_if_generation(
+        &self,
+        workspace_key: WorkspaceKey,
+        repo_id: Option<&str>,
+        commands: Vec<SlashCommandEntry>,
+        generation: u64,
+    ) -> bool {
+        let Ok(refresh) = self.refresh.lock() else {
+            return false;
+        };
+        if refresh.generation(&workspace_key.0) != generation {
+            return false;
+        }
         if let Ok(mut map) = self.workspaces.write() {
             map.insert(workspace_key.clone(), commands.clone());
         }
@@ -100,20 +131,59 @@ impl SlashCommandCache {
                 map.insert(rkey, commands);
             }
         }
+        true
+    }
+
+    pub fn provider_generation(&self, provider: &str) -> u64 {
+        self.refresh
+            .lock()
+            .map(|refresh| refresh.generation(provider))
+            .unwrap_or_default()
     }
 
     /// Try to claim the refresh lock for a workspace key. Returns `true` if
     /// this caller won.
     pub fn try_start_refresh(&self, key: &WorkspaceKey) -> bool {
-        let Ok(mut refreshing) = self.refreshing.lock() else {
-            return false;
+        self.try_start_refresh_with_generation(key).is_some()
+    }
+
+    pub fn try_start_refresh_with_generation(&self, key: &WorkspaceKey) -> Option<u64> {
+        let Ok(mut refresh) = self.refresh.lock() else {
+            return None;
         };
-        refreshing.insert(key.clone())
+        if refresh.in_flight.contains_key(key) {
+            return None;
+        }
+        let generation = refresh.generation(&key.0);
+        refresh.in_flight.insert(key.clone(), generation);
+        Some(generation)
     }
 
     pub fn finish_refresh(&self, key: &WorkspaceKey) {
-        if let Ok(mut refreshing) = self.refreshing.lock() {
-            refreshing.remove(key);
+        if let Ok(mut refresh) = self.refresh.lock() {
+            refresh.in_flight.remove(key);
+        }
+    }
+
+    pub fn finish_refresh_generation(&self, key: &WorkspaceKey, generation: u64) {
+        if let Ok(mut refresh) = self.refresh.lock() {
+            if refresh.in_flight.get(key).copied() == Some(generation) {
+                refresh.in_flight.remove(key);
+            }
+        }
+    }
+
+    pub fn clear_provider(&self, provider: &str) {
+        if let Ok(mut refresh) = self.refresh.lock() {
+            let generation = refresh.generations.entry(provider.to_string()).or_default();
+            *generation = generation.wrapping_add(1);
+            refresh.in_flight.retain(|key, _| key.0 != provider);
+        }
+        if let Ok(mut map) = self.workspaces.write() {
+            map.retain(|key, _| key.0 != provider);
+        }
+        if let Ok(mut map) = self.repos.write() {
+            map.retain(|key, _| key.0 != provider);
         }
     }
 }
@@ -223,6 +293,59 @@ mod tests {
         let key = workspace_key("claude", Some("/repo"), &[]);
         cache.finish_refresh(&key);
         // Subsequent claim still works.
+        assert!(cache.try_start_refresh(&key));
+    }
+
+    #[test]
+    fn clear_provider_removes_only_matching_provider_entries() {
+        let cache = SlashCommandCache::new();
+        let codex_key = workspace_key("codex", Some("/repo"), &[]);
+        let claude_key = workspace_key("claude", Some("/repo"), &[]);
+        cache.set(codex_key.clone(), Some("repo-1"), vec![entry("codex")]);
+        cache.set(claude_key.clone(), Some("repo-1"), vec![entry("claude")]);
+        assert!(cache.try_start_refresh(&codex_key));
+        assert!(cache.try_start_refresh(&claude_key));
+
+        cache.clear_provider("codex");
+
+        assert!(cache.get_workspace(&codex_key).is_none());
+        assert!(cache.get_repo(&repo_key("codex", "repo-1")).is_none());
+        assert!(cache.try_start_refresh(&codex_key));
+        assert!(cache.get_workspace(&claude_key).is_some());
+        assert!(cache.get_repo(&repo_key("claude", "repo-1")).is_some());
+        assert!(!cache.try_start_refresh(&claude_key));
+    }
+
+    #[test]
+    fn set_if_generation_rejects_stale_provider_writes_after_clear() {
+        let cache = SlashCommandCache::new();
+        let key = workspace_key("codex", Some("/repo"), &[]);
+        let generation = cache.provider_generation("codex");
+
+        cache.clear_provider("codex");
+
+        assert!(!cache.set_if_generation(
+            key.clone(),
+            Some("repo-1"),
+            vec![entry("stale")],
+            generation,
+        ));
+        assert!(cache.get_workspace(&key).is_none());
+        assert!(cache.get_repo(&repo_key("codex", "repo-1")).is_none());
+    }
+
+    #[test]
+    fn stale_finish_does_not_clear_new_refresh_marker() {
+        let cache = SlashCommandCache::new();
+        let key = workspace_key("codex", Some("/repo"), &[]);
+        let old_generation = cache.try_start_refresh_with_generation(&key).unwrap();
+
+        cache.clear_provider("codex");
+        let new_generation = cache.try_start_refresh_with_generation(&key).unwrap();
+        cache.finish_refresh_generation(&key, old_generation);
+
+        assert!(!cache.try_start_refresh(&key));
+        cache.finish_refresh_generation(&key, new_generation);
         assert!(cache.try_start_refresh(&key));
     }
 

@@ -30,6 +30,7 @@ import {
 	type RawRequest,
 	requireString,
 } from "./request-parser.js";
+import { parseRuntimeConfigPatch } from "./runtime-config.js";
 import type {
 	Provider,
 	SessionManager,
@@ -406,15 +407,18 @@ async function handleGetContextUsage(
 	}
 }
 
-/// Hot-push runtime config (Cursor API key). Restarting the sidecar
-/// would interrupt unrelated in-flight Claude/Codex turns.
+/// Hot-push runtime config. Restarting the sidecar would interrupt
+/// unrelated in-flight turns.
 function handleUpdateConfig(id: string, params: Record<string, unknown>): void {
 	try {
-		if ("cursorApiKey" in params) {
-			const raw = params.cursorApiKey;
-			const next = typeof raw === "string" ? raw : null;
-			cursorManager.setApiKey(next);
-		}
+		const patch = parseRuntimeConfigPatch(params);
+		if ("cursorApiKey" in patch)
+			cursorManager.setApiKey(patch.cursorApiKey ?? null);
+		if ("codexBinaryPath" in patch)
+			codexManager.setBinaryPath(patch.codexBinaryPath ?? null);
+		if ("codexConfigPath" in patch)
+			codexManager.setConfigPath(patch.codexConfigPath ?? null);
+		if (patch.codexEnv) codexManager.setEnvironment(patch.codexEnv);
 		emitter.pong(id);
 	} catch (err) {
 		const msg = errorMessage(err);

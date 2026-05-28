@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod cli;
 pub(crate) mod codex_config;
+pub(crate) mod codex_provider_env;
 pub(crate) mod commands;
 pub mod data_dir;
 pub mod downloads;
@@ -16,6 +17,7 @@ pub mod logging;
 pub mod maintenance;
 pub mod mcp;
 pub mod models;
+mod path_utils;
 pub mod pipeline;
 pub mod rate_limits;
 pub mod schema;
@@ -386,6 +388,7 @@ pub fn run() {
             commands::system_commands::get_cli_status,
             commands::system_commands::get_data_info,
             commands::system_commands::get_agent_login_status,
+            commands::system_commands::resolve_system_agent_binary,
             commands::system_commands::get_helmor_skills_status,
             commands::system_commands::install_cli,
             commands::system_commands::read_query_cache,

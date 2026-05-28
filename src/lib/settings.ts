@@ -269,6 +269,9 @@ export type AppSettings = {
 	prFastMode: boolean | null;
 	defaultEffort: string | null;
 	defaultFastMode: boolean;
+	/** Codex executable override. Empty string = bundled/default Codex.
+	 *  Non-empty values are passed directly to the Codex app-server spawn. */
+	codexExecutablePath: string;
 	/** Webview zoom factor. 1.0 = 100%. Range 0.5–2.0. */
 	zoomLevel: number;
 	followUpBehavior: FollowUpBehavior;
@@ -369,6 +372,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
 	prFastMode: null,
 	defaultEffort: "high",
 	defaultFastMode: false,
+	codexExecutablePath: "",
 	zoomLevel: 1.0,
 	followUpBehavior: "steer",
 	claudeThinkingDisplay: "summarized",
@@ -537,6 +541,7 @@ const SETTINGS_KEY_MAP: Record<
 	prFastMode: "app.pr_fast_mode",
 	defaultEffort: "app.default_effort",
 	defaultFastMode: "app.default_fast_mode",
+	codexExecutablePath: "app.codex_executable_path",
 	zoomLevel: "app.zoom_level",
 	followUpBehavior: "app.follow_up_behavior",
 	claudeThinkingDisplay: "app.claude_thinking_display",
@@ -1165,6 +1170,9 @@ export async function loadSettings(): Promise<AppSettings> {
 				raw[SETTINGS_KEY_MAP.defaultFastMode] !== undefined
 					? raw[SETTINGS_KEY_MAP.defaultFastMode] === "true"
 					: DEFAULT_SETTINGS.defaultFastMode,
+			codexExecutablePath:
+				raw[SETTINGS_KEY_MAP.codexExecutablePath]?.trim() ??
+				DEFAULT_SETTINGS.codexExecutablePath,
 			zoomLevel: raw[SETTINGS_KEY_MAP.zoomLevel]
 				? Number(raw[SETTINGS_KEY_MAP.zoomLevel])
 				: DEFAULT_SETTINGS.zoomLevel,

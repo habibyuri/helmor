@@ -827,6 +827,12 @@ export async function getAgentLoginStatus(): Promise<AgentLoginStatusResult> {
 	return await invoke<AgentLoginStatusResult>("get_agent_login_status");
 }
 
+export async function resolveSystemAgentBinary(
+	provider: AgentLoginProvider,
+): Promise<string> {
+	return await invoke<string>("resolve_system_agent_binary", { provider });
+}
+
 export async function openAgentLoginTerminal(
 	provider: AgentLoginProvider,
 ): Promise<void> {
@@ -3577,8 +3583,12 @@ export async function setSessionDraft(
 
 /** Read the account-global Codex rate-limit snapshot. Null until Codex has
  *  emitted at least one `account/rateLimits/updated` notification. */
-export async function getCodexRateLimits(): Promise<string | null> {
-	return await invoke<string | null>("get_codex_rate_limits");
+export async function getCodexRateLimits(
+	codexExecutablePath = "",
+): Promise<string | null> {
+	return await invoke<string | null>("get_codex_rate_limits", {
+		codexExecutablePath,
+	});
 }
 
 /** Read the account-global Claude rate-limit snapshot. The string is

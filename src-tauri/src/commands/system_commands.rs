@@ -1012,6 +1012,21 @@ pub async fn get_agent_login_status() -> CmdResult<AgentLoginStatus> {
     .await
 }
 
+#[tauri::command]
+pub async fn resolve_system_agent_binary(provider: String) -> CmdResult<String> {
+    run_blocking(move || {
+        let binary = match provider.as_str() {
+            "codex" => "codex",
+            "claude" => "claude",
+            _ => anyhow::bail!("Unknown agent provider: {provider}"),
+        };
+        crate::path_utils::find_binary_on_path(binary)
+            .map(|path| path.display().to_string())
+            .with_context(|| format!("{binary} was not found on PATH"))
+    })
+    .await
+}
+
 /// Cursor "ready" = non-empty `app.cursor_provider.apiKey`.
 fn cursor_login_ready() -> bool {
     let raw = match crate::models::settings::load_setting_value("app.cursor_provider") {
@@ -1040,6 +1055,12 @@ fn cursor_login_ready() -> bool {
 /// PATH. Falls back to the bare command name (PATH lookup) for dev builds
 /// and as a last resort.
 fn resolve_agent_binary(provider: &str) -> PathBuf {
+    if provider == "codex" {
+        if let Some(path) = sidecar::load_codex_executable_path() {
+            return PathBuf::from(path);
+        }
+    }
+
     let bundled = sidecar::resolve_bundled_agent_paths();
     let bundled_path = match provider {
         "claude" => bundled.claude_bin,
@@ -1080,14 +1101,8 @@ struct CodexAuthStatus {
 }
 
 fn codex_auth_status() -> CodexAuthStatus {
-    if codex_login_ready() {
-        return CodexAuthStatus {
-            ready: true,
-            provider: None,
-            auth_method: Some("login"),
-        };
-    }
-
+    // Prefer API-key providers so Azure/custom-provider users don't see
+    // ChatGPT quota UI even if `codex login` also has a valid session.
     if let Some(provider) = codex_api_key_provider_ready() {
         return CodexAuthStatus {
             ready: true,
@@ -1096,40 +1111,30 @@ fn codex_auth_status() -> CodexAuthStatus {
         };
     }
 
+    match crate::rate_limits::codex::credential_kind_for_home(
+        &crate::codex_config::selected_codex_home(),
+    ) {
+        Some(crate::rate_limits::codex::CodexCredentialKind::ChatGptLogin) => {
+            return CodexAuthStatus {
+                ready: true,
+                provider: None,
+                auth_method: Some("login"),
+            };
+        }
+        Some(crate::rate_limits::codex::CodexCredentialKind::ApiKey) => {
+            return CodexAuthStatus {
+                ready: true,
+                provider: Some("OPENAI_API_KEY".to_string()),
+                auth_method: Some("apiKey"),
+            };
+        }
+        None => {}
+    }
+
     CodexAuthStatus {
         ready: false,
         provider: None,
         auth_method: None,
-    }
-}
-
-fn codex_login_ready() -> bool {
-    match std::process::Command::new(resolve_agent_binary("codex"))
-        .args(["login", "status"])
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            parse_codex_login_status(&format!("{stdout}\n{stderr}"))
-        }
-        Ok(output) => {
-            // `codex login status` exits non-zero with stderr "Not
-            // logged in" when the user is signed out — that's a
-            // routine "no session" answer, not a check failure. Logging
-            // it as "failed" makes legitimate aborts (user closes the
-            // login terminal mid-flow) look like crashes. Demote to
-            // trace.
-            tracing::trace!(
-                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-                "Codex not logged in (login status returned non-zero)"
-            );
-            false
-        }
-        Err(error) => {
-            tracing::debug!("Codex login status unavailable: {error}");
-            false
-        }
     }
 }
 
@@ -1140,21 +1145,16 @@ fn parse_claude_login_status(stdout: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-fn parse_codex_login_status(output: &str) -> bool {
-    let normalized = output.to_ascii_lowercase();
-    normalized.contains("logged in") && !normalized.contains("not logged in")
-}
-
 fn codex_api_key_provider_ready() -> Option<String> {
-    let config = std::fs::read_to_string(crate::codex_config::config_path()).ok()?;
+    let codex_home = crate::codex_config::selected_codex_home();
+    let config =
+        std::fs::read_to_string(crate::codex_config::config_path_for_home(&codex_home)).ok()?;
     let provider = crate::codex_config::active_api_key_provider(&config)?;
-    env_var_is_present(&provider.env_key).then_some(provider.name)
-}
-
-fn env_var_is_present(key: &str) -> bool {
-    std::env::var_os(key)
-        .map(|value| !value.to_string_lossy().trim().is_empty())
-        .unwrap_or(false)
+    let provider_env = crate::codex_provider_env::codex_provider_env_for_selected_home();
+    provider_env
+        .get(&provider.env_key)
+        .is_some_and(|value| !value.trim().is_empty())
+        .then_some(provider.name)
 }
 
 fn agent_login_command(provider: &str) -> anyhow::Result<String> {

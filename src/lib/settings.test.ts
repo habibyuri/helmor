@@ -350,4 +350,26 @@ describe("settings", () => {
 		expect(settings.reviewModelId).toBe("default");
 		expect(settings.prModelId).toBe("default");
 	});
+
+	it("hydrates and saves the Codex executable override", async () => {
+		invokeMock.mockResolvedValue({
+			"app.codex_executable_path": " /opt/codex/bin/codex ",
+		});
+
+		const settings = await loadSettings();
+
+		expect(settings.codexExecutablePath).toBe("/opt/codex/bin/codex");
+
+		invokeMock.mockResolvedValue(undefined);
+		await saveSettings({ codexExecutablePath: "codex" });
+
+		expect(invokeMock).toHaveBeenLastCalledWith(
+			"update_app_settings",
+			expect.objectContaining({
+				settingsMap: expect.objectContaining({
+					"app.codex_executable_path": "codex",
+				}),
+			}),
+		);
+	});
 });

@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -19,14 +19,25 @@ const REFRESH_AFTER_SECONDS: i64 = 8 * 24 * 60 * 60;
 /// frontend, so any future schema additions (new windows, plan types,
 /// etc.) only need a parser tweak — no DB migration.
 pub fn fetch_codex_rate_limits() -> Result<String> {
+    fetch_codex_rate_limits_for_home(&crate::codex_config::default_codex_home())
+}
+
+/// Fetch ChatGPT usage for a specific Codex home. This must match the
+/// executable Helmor is about to run; otherwise a custom wrapper such as
+/// `codexaz` can accidentally display the user's main `~/.codex` quota.
+pub fn fetch_codex_rate_limits_for_home(codex_home: &Path) -> Result<String> {
+    let auth_path = crate::codex_config::auth_path_for_home(codex_home);
+    let mut credentials = load_credentials(&auth_path)
+        .with_context(|| format!("Failed to read {}", auth_path.display()))?;
+    if credentials.kind == CodexCredentialKind::ApiKey {
+        anyhow::bail!("Codex auth.json uses API-key auth; ChatGPT usage is unavailable");
+    }
+
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .context("Failed to build Codex usage client")?;
 
-    let auth_path = auth_file_path();
-    let mut credentials = load_credentials(&auth_path)
-        .with_context(|| format!("Failed to read {}", auth_path.display()))?;
     if credentials.needs_refresh(now_seconds()) {
         match refresh_credentials(&client, &credentials) {
             Ok(refreshed) => {
@@ -65,11 +76,18 @@ pub fn fetch_codex_rate_limits() -> Result<String> {
 
 #[derive(Debug, Clone)]
 struct CodexCredentials {
+    kind: CodexCredentialKind,
     access_token: String,
     refresh_token: String,
     id_token: Option<String>,
     account_id: Option<String>,
     last_refresh: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexCredentialKind {
+    ChatGptLogin,
+    ApiKey,
 }
 
 impl CodexCredentials {
@@ -84,25 +102,6 @@ impl CodexCredentials {
     }
 }
 
-fn auth_file_path() -> PathBuf {
-    if let Ok(custom) = std::env::var("CODEX_HOME") {
-        let trimmed = custom.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed).join("auth.json");
-        }
-    }
-    home_dir().join(".codex").join("auth.json")
-}
-
-fn home_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            return PathBuf::from(home);
-        }
-    }
-    PathBuf::from("/")
-}
-
 fn load_credentials(path: &Path) -> Result<CodexCredentials> {
     let raw = std::fs::read(path).with_context(|| {
         format!(
@@ -111,6 +110,13 @@ fn load_credentials(path: &Path) -> Result<CodexCredentials> {
         )
     })?;
     parse_credentials(&raw)
+}
+
+pub(crate) fn credential_kind_for_home(codex_home: &Path) -> Option<CodexCredentialKind> {
+    let raw = std::fs::read(crate::codex_config::auth_path_for_home(codex_home)).ok()?;
+    parse_credentials(&raw)
+        .ok()
+        .map(|credentials| credentials.kind)
 }
 
 fn parse_credentials(data: &[u8]) -> Result<CodexCredentials> {
@@ -124,6 +130,7 @@ fn parse_credentials(data: &[u8]) -> Result<CodexCredentials> {
         .filter(|value| !value.is_empty())
     {
         return Ok(CodexCredentials {
+            kind: CodexCredentialKind::ApiKey,
             access_token: api_key.to_string(),
             refresh_token: String::new(),
             id_token: None,
@@ -148,6 +155,7 @@ fn parse_credentials(data: &[u8]) -> Result<CodexCredentials> {
         .and_then(parse_iso_to_unix);
 
     Ok(CodexCredentials {
+        kind: CodexCredentialKind::ChatGptLogin,
         access_token,
         refresh_token,
         id_token,
@@ -211,6 +219,7 @@ fn refresh_credentials(
         .json()
         .context("Failed to decode Codex token refresh response")?;
     Ok(CodexCredentials {
+        kind: credentials.kind,
         access_token: refreshed
             .access_token
             .filter(|token| !token.trim().is_empty())
@@ -352,6 +361,7 @@ mod tests {
             "last_refresh": "2026-04-25T06:30:00.000Z"
         }"#;
         let credentials = parse_credentials(data).unwrap();
+        assert_eq!(credentials.kind, CodexCredentialKind::ChatGptLogin);
         assert_eq!(credentials.access_token, "access");
         assert_eq!(credentials.refresh_token, "refresh");
         assert_eq!(credentials.account_id.as_deref(), Some("acct"));
@@ -362,6 +372,7 @@ mod tests {
     fn parses_api_key_only_credentials() {
         let data = br#"{ "OPENAI_API_KEY": "sk-test" }"#;
         let credentials = parse_credentials(data).unwrap();
+        assert_eq!(credentials.kind, CodexCredentialKind::ApiKey);
         assert_eq!(credentials.access_token, "sk-test");
         assert!(credentials.refresh_token.is_empty());
     }
@@ -376,6 +387,7 @@ mod tests {
     fn needs_refresh_when_last_refresh_missing_or_old() {
         let now = 10_000_000;
         let stale = CodexCredentials {
+            kind: CodexCredentialKind::ChatGptLogin,
             access_token: "a".to_string(),
             refresh_token: "r".to_string(),
             id_token: None,
@@ -400,6 +412,7 @@ mod tests {
     #[test]
     fn no_refresh_without_refresh_token() {
         let api_key_only = CodexCredentials {
+            kind: CodexCredentialKind::ApiKey,
             access_token: "sk".to_string(),
             refresh_token: String::new(),
             id_token: None,
@@ -433,6 +446,7 @@ mod tests {
         .unwrap();
 
         let credentials = CodexCredentials {
+            kind: CodexCredentialKind::ChatGptLogin,
             access_token: "new-access".to_string(),
             refresh_token: "new-refresh".to_string(),
             id_token: Some("new-id".to_string()),
@@ -497,6 +511,7 @@ mod tests {
         std::fs::write(&path, b"\xff\xfe garbage").unwrap();
 
         let credentials = CodexCredentials {
+            kind: CodexCredentialKind::ChatGptLogin,
             access_token: "fresh".to_string(),
             refresh_token: "r".to_string(),
             id_token: None,

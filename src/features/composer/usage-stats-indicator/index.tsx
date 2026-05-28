@@ -1,25 +1,16 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useMemo, useState } from "react";
 import { ClaudeIcon, OpenAIIcon } from "@/components/icons";
 import {
 	HoverCard,
 	HoverCardContent,
 	HoverCardTrigger,
 } from "@/components/ui/hover-card";
-import {
-	claudeRateLimitsQueryOptions,
-	codexRateLimitsQueryOptions,
-	helmorQueryKeys,
-} from "@/lib/query-client";
-import { useSettings } from "@/lib/settings";
 import { cn } from "@/lib/utils";
 import {
-	parseClaudeRateLimits,
-	parseCodexRateLimits,
 	type RateLimitWindowDisplay,
 	ringTier,
 } from "../context-usage-ring/parse";
 import { LimitRow } from "../context-usage-ring/popover-parts";
+import { useUsageStats } from "./use-usage-stats";
 
 type Props = {
 	agentType: "claude" | "codex" | "cursor" | null;
@@ -31,49 +22,14 @@ const HOVER_OPEN_DELAY_MS = 180;
 const HOVER_CLOSE_DELAY_MS = 80;
 
 export function UsageStatsIndicator({ agentType, disabled, className }: Props) {
-	const { settings } = useSettings();
-	const [open, setOpen] = useState(false);
-	const queryClient = useQueryClient();
-	const show =
-		settings.showUsageStats &&
-		(agentType === "claude" || agentType === "codex");
+	const { available, isLoading, open, stats, onOpenChange } = useUsageStats({
+		agentType,
+		disabled,
+	});
 
-	const { data: codexRaw = null } = useQuery(
-		codexRateLimitsQueryOptions(show && !disabled && agentType === "codex"),
-	);
-	const { data: claudeRaw = null } = useQuery(
-		claudeRateLimitsQueryOptions(show && !disabled && agentType === "claude"),
-	);
-
-	// Refresh on hover open. The Rust 30 s throttle keeps this from
-	// hammering upstream — within the throttle window the command just
-	// returns the cached body — so this can fire as eagerly as the user
-	// opens the popover.
-	const handleOpenChange = useCallback(
-		(next: boolean) => {
-			setOpen(next);
-			if (!next || disabled) return;
-			const key =
-				agentType === "claude"
-					? helmorQueryKeys.claudeRateLimits
-					: agentType === "codex"
-						? helmorQueryKeys.codexRateLimits
-						: null;
-			if (key) {
-				void queryClient.refetchQueries({ queryKey: key });
-			}
-		},
-		[agentType, disabled, queryClient],
-	);
-
-	const stats = useMemo(() => {
-		if (agentType === "claude") return parseClaudeRateLimits(claudeRaw);
-		if (agentType === "codex") return parseCodexRateLimits(codexRaw);
-		return null;
-	}, [agentType, claudeRaw, codexRaw]);
-
-	if (!show || !stats) return null;
+	if (!available) return null;
 	if (
+		stats &&
 		!stats.primary &&
 		!stats.secondary &&
 		stats.extraWindows.length === 0 &&
@@ -85,7 +41,7 @@ export function UsageStatsIndicator({ agentType, disabled, className }: Props) {
 	return (
 		<HoverCard
 			open={open}
-			onOpenChange={handleOpenChange}
+			onOpenChange={onOpenChange}
 			openDelay={HOVER_OPEN_DELAY_MS}
 			closeDelay={HOVER_CLOSE_DELAY_MS}
 		>
@@ -100,8 +56,8 @@ export function UsageStatsIndicator({ agentType, disabled, className }: Props) {
 					)}
 				>
 					<UsageStatsGlyph
-						primary={stats.primary}
-						secondary={stats.secondary}
+						primary={stats?.primary ?? null}
+						secondary={stats?.secondary ?? null}
 					/>
 				</button>
 			</HoverCardTrigger>
@@ -122,7 +78,10 @@ export function UsageStatsIndicator({ agentType, disabled, className }: Props) {
 							)}
 						</span>
 					</div>
-					{stats.primary || stats.secondary || stats.extraWindows.length > 0 ? (
+					{!stats && isLoading ? (
+						<div className="text-small text-muted-foreground">Loading...</div>
+					) : null}
+					{stats?.primary || stats?.secondary || stats?.extraWindows.length ? (
 						<div className="flex flex-col gap-2.5">
 							{stats.primary ? <LimitRow window={stats.primary} /> : null}
 							{stats.secondary ? <LimitRow window={stats.secondary} /> : null}
@@ -134,7 +93,7 @@ export function UsageStatsIndicator({ agentType, disabled, className }: Props) {
 							))}
 						</div>
 					) : null}
-					{stats.notes.length > 0 ? (
+					{stats && stats.notes.length > 0 ? (
 						<div className="flex flex-col gap-1.5 border-t border-border/40 pt-2.5">
 							{stats.notes.map((note) => (
 								<div

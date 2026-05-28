@@ -8,15 +8,20 @@
  */
 
 import crypto from "node:crypto";
-import { existsSync } from "node:fs";
-import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
 import {
 	CodexAppServer,
 	type JsonRpcNotification,
 	type JsonRpcRequest,
 } from "./codex-app-server.js";
-import { ensureCodexGoalsFeatureEnabled } from "./codex-config.js";
+import {
+	recycleContextIfStale,
+	resolveCodexBinPath,
+	sanitizeEnvMap,
+} from "./codex-binary-lifecycle.js";
+import {
+	codexConfigPath as defaultCodexConfigPath,
+	ensureCodexGoalsFeatureEnabled,
+} from "./codex-config.js";
 import { SubAgentTracker } from "./codex-subagent-tracker.js";
 import { buildCodexStoredMeta } from "./context-usage.js";
 import type { SidecarEmitter } from "./emitter.js";
@@ -43,74 +48,6 @@ import {
 	parseTitleAndBranchWithDiagnostics,
 	TITLE_GENERATION_TIMEOUT_MS,
 } from "./title.js";
-
-/**
- * Resolve the path to the Codex native binary, used as the spawn target for
- * every `codex app-server` child process.
- *
- * Resolution order:
- *   1. `HELMOR_CODEX_BIN_PATH` — set by the Tauri host in release builds,
- *      pointing at `Helmor.app/Contents/Resources/vendor/codex/codex`.
- *   2. `createRequire` lookup of the platform sub-package's binary inside
- *      `node_modules`. Used in dev (`bun run src/index.ts`) and `bun test`.
- *   3. Fall back to `"codex"` so the OS resolves it from PATH — last-resort
- *      for unusual setups; surfaces as ENOENT if not installed.
- */
-function resolveCodexBinPath(): string {
-	const override = process.env.HELMOR_CODEX_BIN_PATH;
-	if (override) {
-		return override;
-	}
-	const triple = codexTargetTriple();
-	if (triple) {
-		const platformPkg = `@openai/codex-${platformShort()}`;
-		try {
-			const require = createRequire(import.meta.url);
-			const pkgJson = require.resolve(`${platformPkg}/package.json`);
-			const candidate = join(
-				dirname(pkgJson),
-				"vendor",
-				triple,
-				"codex",
-				process.platform === "win32" ? "codex.exe" : "codex",
-			);
-			if (existsSync(candidate)) {
-				return candidate;
-			}
-		} catch {
-			// Platform sub-package missing (e.g. --omit=optional) — fall through.
-		}
-	}
-	return "codex";
-}
-
-function platformShort(): string {
-	const arch = process.arch === "x64" ? "x64" : "arm64";
-	if (process.platform === "darwin") return `darwin-${arch}`;
-	if (process.platform === "linux") return `linux-${arch}`;
-	if (process.platform === "win32") return `win32-${arch}`;
-	return "";
-}
-
-function codexTargetTriple(): string | null {
-	const arch = process.arch;
-	if (process.platform === "darwin") {
-		return arch === "arm64" ? "aarch64-apple-darwin" : "x86_64-apple-darwin";
-	}
-	if (process.platform === "linux") {
-		return arch === "arm64"
-			? "aarch64-unknown-linux-musl"
-			: "x86_64-unknown-linux-musl";
-	}
-	if (process.platform === "win32") {
-		return arch === "arm64"
-			? "aarch64-pc-windows-msvc"
-			: "x86_64-pc-windows-msvc";
-	}
-	return null;
-}
-
-const CODEX_BIN_PATH = resolveCodexBinPath();
 
 /**
  * Recognised `/goal` slash-command shapes. `set` carries the objective;
@@ -183,6 +120,7 @@ const RECOVERABLE_RESUME_SNIPPETS = [
 	"no such thread",
 	"unknown thread",
 	"does not exist",
+	"no rollout found",
 ];
 
 function isRecoverableResumeError(err: unknown): boolean {
@@ -343,6 +281,8 @@ function buildCodexAnswers(
 
 interface AppServerContext {
 	server: CodexAppServer;
+	/** Binary used to spawn this app-server process. */
+	binaryPath?: string;
 	providerThreadId: string | null;
 	activeTurnId: string | null;
 	turnResolve: (() => void) | null;
@@ -441,6 +381,44 @@ export class CodexAppServerManager implements SessionManager {
 	private sessions = new Map<string, AppServerContext>();
 	private pendingApprovals = new Map<string, PendingApproval>();
 	private pendingUserInputs = new Map<string, PendingUserInput>();
+	private codexBinPath = resolveCodexBinPath();
+	private codexConfigPath = defaultCodexConfigPath();
+	private codexEnv: Record<string, string> = {};
+
+	setEnvironment(env: Record<string, string> | null): void {
+		this.codexEnv = sanitizeEnvMap(env);
+	}
+
+	setConfigPath(path: string | null): void {
+		const trimmed = path?.trim();
+		this.codexConfigPath = trimmed || defaultCodexConfigPath();
+	}
+
+	setBinaryPath(binaryPath: string | null): void {
+		const next = resolveCodexBinPath(binaryPath);
+		if (next === this.codexBinPath) return;
+
+		const previous = this.codexBinPath;
+		this.codexBinPath = next;
+		let recycled = 0;
+		let deferred = 0;
+
+		for (const [sessionId, ctx] of this.sessions) {
+			const decision = recycleContextIfStale(ctx, next, previous, () => {
+				this.sessions.delete(sessionId);
+				this.clearPendingSessionState(sessionId);
+			});
+			if (decision === "defer") deferred++;
+			if (decision === "recycled") recycled++;
+		}
+
+		logger.info("Codex binary path updated", {
+			previous,
+			next,
+			recycled,
+			deferred,
+		});
+	}
 
 	/** Called by index.ts when frontend responds to a permission prompt. */
 	resolvePermission(permissionId: string, behavior: "allow" | "deny"): void {
@@ -1060,8 +1038,9 @@ export class CodexAppServerManager implements SessionManager {
 		const model = options?.model?.trim() || pickFastestCodexModel();
 		const fastMode = modelSupportsFastMode("codex", model);
 		const server = new CodexAppServer({
-			binaryPath: CODEX_BIN_PATH,
+			binaryPath: this.codexBinPath,
 			cwd,
+			env: this.codexEnv,
 			onNotification: () => {},
 			onRequest: (req) => {
 				if (APPROVAL_METHODS.has(req.method)) {
@@ -1181,8 +1160,9 @@ export class CodexAppServerManager implements SessionManager {
 		const cwd = params.cwd ?? process.cwd();
 		const cwds = collectSkillCwds(cwd, params.additionalDirectories);
 		const server = new CodexAppServer({
-			binaryPath: CODEX_BIN_PATH,
+			binaryPath: this.codexBinPath,
 			cwd,
+			env: this.codexEnv,
 			onNotification: () => {},
 			onRequest: () => {},
 			onExit: () => {},
@@ -1320,7 +1300,7 @@ export class CodexAppServerManager implements SessionManager {
 	): Promise<string | undefined> {
 		let result: Awaited<ReturnType<typeof ensureCodexGoalsFeatureEnabled>>;
 		try {
-			result = await ensureCodexGoalsFeatureEnabled();
+			result = await ensureCodexGoalsFeatureEnabled(this.codexConfigPath);
 		} catch (err) {
 			logger.error("ensureCodexGoalsFeatureEnabled failed", errorDetails(err));
 			return callerResume;
@@ -1609,8 +1589,38 @@ export class CodexAppServerManager implements SessionManager {
 		permissionMode?: string,
 		fastMode?: boolean,
 	): Promise<AppServerContext> {
+		const binaryPath = this.codexBinPath;
 		const existing = this.sessions.get(sessionId);
-		if (existing && !existing.server.killed) return existing;
+		if (existing && !existing.server.killed) {
+			const existingBinaryPath = existing.binaryPath ?? binaryPath;
+			const decision = recycleContextIfStale(
+				existing,
+				binaryPath,
+				existingBinaryPath,
+				() => {
+					this.sessions.delete(sessionId);
+					this.clearPendingSessionState(sessionId);
+				},
+			);
+			if (decision === "keep") return existing;
+			if (decision === "defer") {
+				logger.info("Codex binary changed; deferring recycle until turn ends", {
+					sessionId,
+					activeTurnId: existing.activeTurnId ?? "(none)",
+					previous: existingBinaryPath,
+					next: binaryPath,
+				});
+				return existing;
+			}
+
+			logger.info("Recycling idle Codex context after binary path change", {
+				sessionId,
+				providerThreadId: existing.providerThreadId ?? "(none)",
+				previous: existingBinaryPath,
+				next: binaryPath,
+			});
+			resume = resume ?? existing.providerThreadId ?? undefined;
+		}
 
 		// Forward-reference holder so the `onRetry` closure can reach the
 		// context that's constructed below — the callback only fires once
@@ -1619,8 +1629,9 @@ export class CodexAppServerManager implements SessionManager {
 		const ctxRef: { current: AppServerContext | null } = { current: null };
 
 		const server = new CodexAppServer({
-			binaryPath: CODEX_BIN_PATH,
+			binaryPath,
 			cwd,
+			env: this.codexEnv,
 			onNotification: () => {},
 			onRequest: () => {},
 			onExit: (code, signal) => {
@@ -1628,7 +1639,9 @@ export class CodexAppServerManager implements SessionManager {
 				if (ctx) {
 					this.settleUnexpectedExit(sessionId, ctx, code, signal);
 				}
-				this.sessions.delete(sessionId);
+				if (this.sessions.get(sessionId) === ctx) {
+					this.sessions.delete(sessionId);
+				}
 			},
 			onError: (err) => {
 				logger.error("codex app-server error", errorDetails(err));
@@ -1712,6 +1725,7 @@ export class CodexAppServerManager implements SessionManager {
 
 		const ctx: AppServerContext = {
 			server,
+			binaryPath,
 			providerThreadId: threadId,
 			activeTurnId: null,
 			turnResolve: null,

@@ -176,6 +176,8 @@ vi.mock("@tauri-apps/api/core", () => ({
 					buildMode: "development",
 					installState: "missing",
 				};
+			case "resolve_system_agent_binary":
+				return "/usr/local/bin/codex";
 			case "get_helmor_skills_status":
 				return {
 					installed: false,

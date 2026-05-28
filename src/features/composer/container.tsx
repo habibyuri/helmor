@@ -33,6 +33,7 @@ import type {
 } from "@/lib/composer-insert";
 import {
 	agentModelSectionsQueryOptions,
+	agentRuntimeQuerySegment,
 	autoCloseActionKindsQueryOptions,
 	helmorQueryKeys,
 	sessionCodexGoalQueryOptions,
@@ -675,6 +676,7 @@ export const WorkspaceComposerContainer = memo(
 				workingDirectory,
 				effectiveRepoId,
 				displayedWorkspaceId,
+				agentRuntimeQuerySegment(slashProvider, settings),
 			),
 			enabled: Boolean(workingDirectory) || Boolean(effectiveRepoId),
 		});

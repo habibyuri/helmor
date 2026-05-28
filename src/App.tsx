@@ -162,12 +162,12 @@ function MainApp() {
 		() => ({
 			settings: appSettings ?? preloadSettings,
 			isLoaded: appSettings !== null,
-			updateSettings: (patch: Partial<AppSettings>) => {
+			updateSettings: async (patch: Partial<AppSettings>) => {
 				setAppSettings((previous) => {
 					const next = { ...(previous ?? DEFAULT_SETTINGS), ...patch };
 					return next;
 				});
-				return saveSettings(patch);
+				await saveSettings(patch);
 			},
 		}),
 		[appSettings, preloadSettings],

@@ -27,6 +27,7 @@ const serverState = {
 	 *  `turn/started` and `turn/completed` (e.g. `thread/tokenUsage/updated`). */
 	beforeTurnCompleted: null as null | (() => void),
 	exitAfterTurnStarted: false,
+	resumeErrors: new Map<string, string>(),
 	instances: [] as MockCodexAppServer[],
 	responses: [] as Array<{ id: string | number; result: unknown }>,
 };
@@ -39,14 +40,23 @@ const codexConfigState = {
 		path: "/fake/.codex/config.toml",
 	},
 	calls: 0,
+	paths: [] as Array<string | undefined>,
 };
 
 class MockCodexAppServer {
 	killed = false;
+	binaryPath: string;
+	env: Record<string, string> | undefined;
+	onExit: (code: number | null, signal: string | null) => void;
 
 	constructor(opts: {
+		binaryPath: string;
+		env?: Record<string, string>;
 		onExit: (code: number | null, signal: string | null) => void;
 	}) {
+		this.binaryPath = opts.binaryPath;
+		this.env = opts.env;
+		this.onExit = opts.onExit;
 		serverState.onExit = opts.onExit;
 		serverState.instances.push(this);
 	}
@@ -62,6 +72,10 @@ class MockCodexAppServer {
 			const threadId =
 				(params as { threadId?: string } | undefined)?.threadId ??
 				"thread-resumed";
+			const resumeError = serverState.resumeErrors.get(threadId);
+			if (resumeError) {
+				throw new Error(resumeError);
+			}
 			return { thread: { id: threadId } };
 		}
 		if (method === "thread/goal/set") {
@@ -152,8 +166,9 @@ mock.module("../src/git-access.js", () => ({
 }));
 
 mock.module("../src/codex-config.js", () => ({
-	ensureCodexGoalsFeatureEnabled: async () => {
+	ensureCodexGoalsFeatureEnabled: async (path?: string) => {
 		codexConfigState.calls += 1;
+		codexConfigState.paths.push(path);
 		return { ...codexConfigState.result };
 	},
 	codexConfigPath: () => codexConfigState.result.path,
@@ -173,6 +188,7 @@ describe("CodexAppServerManager", () => {
 		serverState.onExit = null;
 		serverState.beforeTurnCompleted = null;
 		serverState.exitAfterTurnStarted = false;
+		serverState.resumeErrors = new Map();
 		serverState.instances = [];
 		serverState.responses = [];
 		gitAccessState.directories = [];
@@ -181,6 +197,7 @@ describe("CodexAppServerManager", () => {
 			path: "/fake/.codex/config.toml",
 		};
 		codexConfigState.calls = 0;
+		codexConfigState.paths = [];
 		emitter = createSidecarEmitter(() => {});
 	});
 
@@ -227,6 +244,240 @@ describe("CodexAppServerManager", () => {
 			]),
 		);
 		expect(serverState.requests).toEqual([]);
+	});
+
+	test("uses the configured Codex binary for new sessions and recycles idle contexts", async () => {
+		const manager = new CodexAppServerManager();
+		manager.setBinaryPath("/tmp/codex-a");
+
+		await manager.sendMessage(
+			"REQ-binary-a",
+			{
+				sessionId: "session-binary",
+				prompt: "hello",
+				model: "gpt-5.4",
+				cwd: "/tmp",
+				resume: undefined,
+				permissionMode: undefined,
+				effortLevel: "medium",
+				fastMode: false,
+				images: [],
+			},
+			emitter,
+		);
+
+		const stale = serverState.instances[0];
+		expect(stale?.binaryPath).toBe("/tmp/codex-a");
+		expect(stale?.killed).toBe(false);
+
+		manager.setBinaryPath("/tmp/codex-b");
+		expect(stale?.killed).toBe(true);
+
+		serverState.requests = [];
+		await manager.sendMessage(
+			"REQ-binary-b",
+			{
+				sessionId: "session-binary",
+				prompt: "hello again",
+				model: "gpt-5.4",
+				cwd: "/tmp",
+				resume: undefined,
+				permissionMode: undefined,
+				effortLevel: "medium",
+				fastMode: false,
+				images: [],
+			},
+			emitter,
+		);
+
+		expect(serverState.instances).toHaveLength(2);
+		expect(serverState.instances[1]?.binaryPath).toBe("/tmp/codex-b");
+		expect(serverState.requests.some((r) => r.method === "thread/start")).toBe(
+			true,
+		);
+	});
+
+	test("defers Codex binary recycling for active turns and resumes the old thread after completion", async () => {
+		const manager = new CodexAppServerManager();
+		manager.setBinaryPath("/tmp/codex-a");
+
+		serverState.beforeTurnCompleted = () => {
+			manager.setBinaryPath("/tmp/codex-b");
+		};
+
+		await manager.sendMessage(
+			"REQ-binary-active",
+			{
+				sessionId: "session-binary-active",
+				prompt: "work while active",
+				model: "gpt-5.4",
+				cwd: "/tmp",
+				resume: undefined,
+				permissionMode: undefined,
+				effortLevel: "medium",
+				fastMode: false,
+				images: [],
+			},
+			emitter,
+		);
+
+		const stale = serverState.instances[0];
+		expect(stale?.binaryPath).toBe("/tmp/codex-a");
+		expect(stale?.killed).toBe(false);
+
+		serverState.beforeTurnCompleted = null;
+		serverState.requests = [];
+		await manager.sendMessage(
+			"REQ-binary-after-active",
+			{
+				sessionId: "session-binary-active",
+				prompt: "continue",
+				model: "gpt-5.4",
+				cwd: "/tmp",
+				resume: undefined,
+				permissionMode: undefined,
+				effortLevel: "medium",
+				fastMode: false,
+				images: [],
+			},
+			emitter,
+		);
+
+		expect(stale?.killed).toBe(true);
+		expect(serverState.instances).toHaveLength(2);
+		expect(serverState.instances[1]?.binaryPath).toBe("/tmp/codex-b");
+		const resume = serverState.requests.find(
+			(r) => r.method === "thread/resume",
+		);
+		expect(resume?.params).toMatchObject({ threadId: "thread-1" });
+	});
+
+	test("falls back to a fresh Codex thread when selected binary cannot find the old rollout", async () => {
+		const manager = new CodexAppServerManager();
+		serverState.resumeErrors.set(
+			"thread-from-other-home",
+			"thread/resume failed: no rollout found for thread id 019e66d1-e328-72a1-b4cc-436ead6e4fa8",
+		);
+
+		await manager.sendMessage(
+			"REQ-missing-rollout",
+			{
+				sessionId: "session-missing-rollout",
+				prompt: "continue",
+				model: "gpt-5.4",
+				cwd: "/tmp",
+				resume: "thread-from-other-home",
+				permissionMode: undefined,
+				effortLevel: "medium",
+				fastMode: false,
+				images: [],
+			},
+			emitter,
+		);
+
+		expect(serverState.requests.map((request) => request.method)).toContain(
+			"thread/resume",
+		);
+		expect(serverState.requests.map((request) => request.method)).toContain(
+			"thread/start",
+		);
+		const turnStart = serverState.requests.find(
+			(request) => request.method === "turn/start",
+		);
+		expect(turnStart?.params).toMatchObject({ threadId: "thread-1" });
+	});
+
+	test("passes hot-pushed Codex environment to new app-server children", async () => {
+		const manager = new CodexAppServerManager();
+		manager.setEnvironment({
+			AZURE_OPENAI_API_KEY: "secret",
+			EMPTY_KEY: " ",
+		});
+
+		await manager.sendMessage(
+			"REQ-binary-env",
+			{
+				sessionId: "session-binary-env",
+				prompt: "hello",
+				model: "gpt-5.4",
+				cwd: "/tmp",
+				resume: undefined,
+				permissionMode: undefined,
+				effortLevel: "medium",
+				fastMode: false,
+				images: [],
+			},
+			emitter,
+		);
+
+		expect(serverState.instances[0]?.env).toMatchObject({
+			AZURE_OPENAI_API_KEY: "secret",
+		});
+		expect(serverState.instances[0]?.env).not.toHaveProperty("EMPTY_KEY");
+	});
+
+	test("stale Codex child exits do not delete a replacement context", async () => {
+		const manager = new CodexAppServerManager();
+		manager.setBinaryPath("/tmp/codex-a");
+
+		await manager.sendMessage(
+			"REQ-stale-exit-a",
+			{
+				sessionId: "session-stale-exit",
+				prompt: "hello",
+				model: "gpt-5.4",
+				cwd: "/tmp",
+				resume: undefined,
+				permissionMode: undefined,
+				effortLevel: "medium",
+				fastMode: false,
+				images: [],
+			},
+			emitter,
+		);
+
+		const stale = serverState.instances[0];
+		manager.setBinaryPath("/tmp/codex-b");
+
+		await manager.sendMessage(
+			"REQ-stale-exit-b",
+			{
+				sessionId: "session-stale-exit",
+				prompt: "hello again",
+				model: "gpt-5.4",
+				cwd: "/tmp",
+				resume: undefined,
+				permissionMode: undefined,
+				effortLevel: "medium",
+				fastMode: false,
+				images: [],
+			},
+			emitter,
+		);
+
+		stale?.onExit(0, null);
+		serverState.requests = [];
+
+		await manager.sendMessage(
+			"REQ-stale-exit-c",
+			{
+				sessionId: "session-stale-exit",
+				prompt: "continue",
+				model: "gpt-5.4",
+				cwd: "/tmp",
+				resume: undefined,
+				permissionMode: undefined,
+				effortLevel: "medium",
+				fastMode: false,
+				images: [],
+			},
+			emitter,
+		);
+
+		expect(serverState.instances).toHaveLength(2);
+		expect(serverState.requests.some((r) => r.method === "thread/start")).toBe(
+			false,
+		);
 	});
 
 	test("forwards service tier when fast mode is enabled for a codex model", async () => {
@@ -940,6 +1191,7 @@ describe("CodexAppServerManager goal pre-flight", () => {
 		serverState.onExit = null;
 		serverState.beforeTurnCompleted = null;
 		serverState.exitAfterTurnStarted = false;
+		serverState.resumeErrors = new Map();
 		serverState.instances = [];
 		serverState.responses = [];
 		gitAccessState.directories = [];
@@ -948,6 +1200,7 @@ describe("CodexAppServerManager goal pre-flight", () => {
 			path: "/fake/.codex/config.toml",
 		};
 		codexConfigState.calls = 0;
+		codexConfigState.paths = [];
 		emitter = createSidecarEmitter(() => {});
 	});
 
@@ -975,6 +1228,7 @@ describe("CodexAppServerManager goal pre-flight", () => {
 		);
 
 		expect(codexConfigState.calls).toBe(1);
+		expect(codexConfigState.paths).toEqual(["/fake/.codex/config.toml"]);
 		expect(serverState.instances).toHaveLength(1);
 		expect(serverState.instances[0]?.killed).toBe(false);
 		const goalSet = serverState.requests.find(
@@ -1193,5 +1447,30 @@ describe("CodexAppServerManager goal pre-flight", () => {
 		);
 
 		expect(codexConfigState.calls).toBe(0);
+	});
+
+	test("/goal pre-flight targets the host-pushed Codex config path", async () => {
+		const manager = new CodexAppServerManager();
+		manager.setBinaryPath("/tmp/codexaz");
+		manager.setConfigPath("/homes/codexaz/config.toml");
+
+		await manager.sendMessage(
+			"REQ-goal-selected-home",
+			{
+				sessionId: "s-goal-selected-home",
+				prompt: "/goal use selected home",
+				model: "gpt-5.4",
+				cwd: "/tmp",
+				resume: undefined,
+				permissionMode: undefined,
+				effortLevel: "medium",
+				fastMode: false,
+				images: [],
+			},
+			emitter,
+		);
+
+		expect(codexConfigState.paths).toEqual(["/homes/codexaz/config.toml"]);
+		expect(serverState.instances[0]?.binaryPath).toBe("/tmp/codexaz");
 	});
 });

@@ -629,6 +629,7 @@ pub async fn list_slash_commands(
         repo_id,
         "list_slash_commands cache miss; fetching full result synchronously"
     );
+    let generation = cache.provider_generation(&request.provider);
     let commands = fetch_from_sidecar(&sidecar, &request, &additional_directories)?;
     tracing::debug!(
         provider = %request.provider,
@@ -637,7 +638,12 @@ pub async fn list_slash_commands(
         count = commands.len(),
         "list_slash_commands sync fetch succeeded"
     );
-    cache.set(ws_key, request.repo_id.as_deref(), commands.clone());
+    cache.set_if_generation(
+        ws_key,
+        request.repo_id.as_deref(),
+        commands.clone(),
+        generation,
+    );
     Ok(SlashCommandsResponse { commands })
 }
 
@@ -974,14 +980,14 @@ fn spawn_background_refresh(
     request: &ListSlashCommandsRequest,
     ws_key: super::slash_commands::WorkspaceKey,
 ) {
-    if !cache.try_start_refresh(&ws_key) {
+    let Some(refresh_generation) = cache.try_start_refresh_with_generation(&ws_key) else {
         tracing::debug!(
             provider = %request.provider,
             cwd = request.working_directory.as_deref().unwrap_or(""),
             "Background slash command refresh skipped; another refresh is in flight"
         );
         return;
-    }
+    };
 
     tracing::debug!(
         provider = %request.provider,
@@ -1010,7 +1016,12 @@ fn spawn_background_refresh(
                         count = commands.len(),
                         "Background slash command refresh succeeded"
                     );
-                    cache_state.set(ws_key, request.repo_id.as_deref(), commands);
+                    cache_state.set_if_generation(
+                        ws_key,
+                        request.repo_id.as_deref(),
+                        commands,
+                        refresh_generation,
+                    );
                 }
                 Err(e) => {
                     // Don't clear the cache — stale local data is better than nothing.
@@ -1018,7 +1029,7 @@ fn spawn_background_refresh(
                 }
             }
 
-            cache_state.finish_refresh(&refresh_key);
+            cache_state.finish_refresh_generation(&refresh_key, refresh_generation);
         })
         .ok();
 }

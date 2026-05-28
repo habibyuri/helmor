@@ -108,6 +108,22 @@ pub fn load_cursor_api_key() -> Option<String> {
     (!key.is_empty()).then(|| key.to_string())
 }
 
+/// Read the optional Codex executable override. Empty/missing means the
+/// sidecar should use its normal bundled/dev resolution path.
+pub fn load_codex_executable_path() -> Option<String> {
+    let raw = crate::models::settings::load_setting_value("app.codex_executable_path")
+        .ok()
+        .flatten()?;
+    let path = raw.trim();
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+fn selected_codex_config_path_string() -> String {
+    crate::codex_config::config_path_for_home(&crate::codex_config::selected_codex_home())
+        .display()
+        .to_string()
+}
+
 fn resolve_bundled_agent_paths_for_exe(exe: &std::path::Path) -> Option<BundledAgentPaths> {
     let exe_dir = exe.parent()?;
     let contents_dir = exe_dir.parent()?;
@@ -191,9 +207,9 @@ impl SidecarProcess {
                 cmd.env("HELMOR_CODEX_BIN_PATH", &path);
             }
         }
-        // Cursor key is NOT env-passed — pushed via `updateConfig` RPC
-        // (see `push_cursor_api_key`) so key changes don't restart the
-        // shared sidecar and interrupt other providers' turns.
+        // Host-managed runtime settings are pushed via `updateConfig` RPC
+        // so changes don't restart the shared sidecar and interrupt other
+        // providers' turns.
 
         tracing::debug!(
             cmd = if is_dev {
@@ -400,17 +416,20 @@ impl ManagedSidecar {
                 return Err(error);
             }
 
-            // Push saved key so the first cursor request finds it set.
-            // Best-effort: failures fall through to the "not configured" error.
-            if let Some(key) = load_cursor_api_key() {
-                let init = SidecarRequest {
-                    id: Uuid::new_v4().to_string(),
-                    method: "updateConfig".to_string(),
-                    params: serde_json::json!({ "cursorApiKey": key }),
-                };
-                if let Err(error) = guard.as_ref().unwrap().send(&init) {
-                    tracing::warn!("Initial Cursor key push failed: {error}");
-                }
+            // Push host-managed runtime config before the first real request.
+            // Best-effort: failures fall through to provider-specific errors.
+            let init = SidecarRequest {
+                id: Uuid::new_v4().to_string(),
+                method: "updateConfig".to_string(),
+                params: serde_json::json!({
+                    "cursorApiKey": load_cursor_api_key(),
+                    "codexBinaryPath": load_codex_executable_path(),
+                    "codexConfigPath": selected_codex_config_path_string(),
+                    "codexEnv": crate::codex_provider_env::codex_provider_env_for_selected_home(),
+                }),
+            };
+            if let Err(error) = guard.as_ref().unwrap().send(&init) {
+                tracing::warn!("Initial sidecar config push failed: {error}");
             }
         }
 
@@ -420,6 +439,28 @@ impl ManagedSidecar {
     /// Hot-push Cursor API key (or null) via `updateConfig`. Best-effort;
     /// no-op when sidecar isn't running — next spawn will pick it up.
     pub fn push_cursor_api_key(&self, key: Option<String>) {
+        self.push_runtime_config(serde_json::json!({
+            "cursorApiKey": key,
+        }));
+    }
+
+    /// Hot-push Codex executable override and selected-home env via
+    /// `updateConfig`. Existing active Codex turns keep their current child;
+    /// idle contexts are recycled by the sidecar so later turns use the new
+    /// binary.
+    pub fn push_codex_binary_config(
+        &self,
+        path: Option<String>,
+        env: std::collections::HashMap<String, String>,
+    ) {
+        self.push_runtime_config(serde_json::json!({
+            "codexBinaryPath": path,
+            "codexConfigPath": selected_codex_config_path_string(),
+            "codexEnv": env,
+        }));
+    }
+
+    fn push_runtime_config(&self, params: serde_json::Value) {
         let mut guard = match self.process.lock() {
             Ok(g) => g,
             Err(e) => {
@@ -436,12 +477,10 @@ impl ManagedSidecar {
         let request = SidecarRequest {
             id: Uuid::new_v4().to_string(),
             method: "updateConfig".to_string(),
-            params: serde_json::json!({
-                "cursorApiKey": key,
-            }),
+            params,
         };
         if let Err(error) = process.send(&request) {
-            tracing::warn!("Failed to push Cursor API key to sidecar: {error}");
+            tracing::warn!("Failed to push runtime config to sidecar: {error}");
         }
     }
 
