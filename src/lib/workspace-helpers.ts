@@ -71,6 +71,11 @@ export function flattenWorkspaceRowsForNavigation(
 	return [...groups.flatMap((group) => group.rows), ...archivedRows];
 }
 
+/**
+ * Pick a replacement focus after removal. Group-aware: stay in the same
+ * bucket → next-non-empty group → archived. Callers MUST pass current/next
+ * in the same visual layout (`projectVisualSidebar` enforces this).
+ */
 export function findReplacementWorkspaceIdAfterRemoval({
 	currentGroups,
 	currentArchivedRows,
@@ -84,27 +89,65 @@ export function findReplacementWorkspaceIdAfterRemoval({
 	nextArchivedRows: WorkspaceRow[];
 	removedWorkspaceId: string;
 }): string | null {
-	const currentRows = flattenWorkspaceRowsForNavigation(
+	const removed = locateInLayout(
 		currentGroups,
 		currentArchivedRows,
-	);
-	const removedIndex = currentRows.findIndex(
-		(row) => row.id === removedWorkspaceId,
-	);
-	const nextRows = flattenWorkspaceRowsForNavigation(
-		nextGroups,
-		nextArchivedRows,
+		removedWorkspaceId,
 	);
 
-	if (nextRows.length === 0) {
-		return null;
+	// (1) Stay inside the removed workspace's bucket when it still has
+	// siblings.
+	if (removed.kind === "group") {
+		const nextSameGroup = nextGroups.find((g) => g.id === removed.groupId);
+		const rows = nextSameGroup?.rows ?? [];
+		if (rows.length > 0) {
+			return (
+				rows[removed.indexInGroup]?.id ??
+				rows[removed.indexInGroup - 1]?.id ??
+				rows[rows.length - 1]?.id ??
+				null
+			);
+		}
+	} else if (removed.kind === "archived") {
+		if (nextArchivedRows.length > 0) {
+			return (
+				nextArchivedRows[removed.indexInArchived]?.id ??
+				nextArchivedRows[removed.indexInArchived - 1]?.id ??
+				nextArchivedRows[nextArchivedRows.length - 1]?.id ??
+				null
+			);
+		}
 	}
 
-	if (removedIndex === -1) {
-		return nextRows[0]?.id ?? null;
+	// (2) Bucket exhausted — first non-empty group, then archived.
+	for (const group of nextGroups) {
+		const firstId = group.rows[0]?.id;
+		if (firstId) return firstId;
 	}
+	return nextArchivedRows[0]?.id ?? null;
+}
 
-	return nextRows[removedIndex]?.id ?? nextRows[removedIndex - 1]?.id ?? null;
+type WorkspaceLayoutLocation =
+	| { kind: "group"; groupId: string; indexInGroup: number }
+	| { kind: "archived"; indexInArchived: number }
+	| { kind: "none" };
+
+function locateInLayout(
+	groups: WorkspaceGroup[],
+	archivedRows: WorkspaceRow[],
+	id: string,
+): WorkspaceLayoutLocation {
+	for (const group of groups) {
+		const indexInGroup = group.rows.findIndex((r) => r.id === id);
+		if (indexInGroup !== -1) {
+			return { kind: "group", groupId: group.id, indexInGroup };
+		}
+	}
+	const indexInArchived = archivedRows.findIndex((r) => r.id === id);
+	if (indexInArchived !== -1) {
+		return { kind: "archived", indexInArchived };
+	}
+	return { kind: "none" };
 }
 
 export function hasWorkspaceId(

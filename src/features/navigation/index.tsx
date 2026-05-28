@@ -455,12 +455,11 @@ export const WorkspacesSidebar = memo(function WorkspacesSidebar({
 				continue;
 			}
 
-			// The Chats bucket has no status-group semantics — when no chat
-			// workspaces exist, drop the section entirely (header + gap)
-			// so the sidebar isn't littered with an always-empty bucket.
-			// Status / repo buckets keep their empty header because users
-			// rely on them as drop targets for the next drag.
-			if (group.id === "chats" && group.rows.length === 0) {
+			// Chats + Triage have no drop-target role — hide when empty.
+			if (
+				(group.id === "chats" || group.id === "ai-tasks") &&
+				group.rows.length === 0
+			) {
 				continue;
 			}
 

@@ -8,6 +8,7 @@
  */
 
 import crypto from "node:crypto";
+import type { AgentProxySettings } from "./agent-proxy.js";
 import {
 	CodexAppServer,
 	type JsonRpcNotification,
@@ -305,6 +306,8 @@ interface AppServerContext {
 	notificationGate: Promise<void> | null;
 	/** Last send's model id; Codex usage notifications omit it. */
 	lastSentModel: string;
+	/** Stable key for the proxy env used to spawn this app-server. */
+	agentProxyKey: string;
 	/** Wall-clock ms of the most recent "Reconnecting…" line on the
 	 *  Codex child process's stderr. Used to suppress the transient
 	 *  {method:"error"} notifications that Codex emits during its own
@@ -509,6 +512,7 @@ export class CodexAppServerManager implements SessionManager {
 			effortLevel,
 			permissionMode,
 			fastMode,
+			agentProxy,
 			additionalDirectories,
 			images,
 		} = params;
@@ -551,6 +555,7 @@ export class CodexAppServerManager implements SessionManager {
 			model,
 			permissionMode,
 			effectiveFastMode,
+			agentProxy,
 		);
 		// Codex usage notifications do not include a model id.
 		if (model) ctx.lastSentModel = model;
@@ -1041,6 +1046,7 @@ export class CodexAppServerManager implements SessionManager {
 			binaryPath: this.codexBinPath,
 			cwd,
 			env: this.codexEnv,
+			agentProxy: options?.agentProxy,
 			onNotification: () => {},
 			onRequest: (req) => {
 				if (APPROVAL_METHODS.has(req.method)) {
@@ -1588,12 +1594,14 @@ export class CodexAppServerManager implements SessionManager {
 		model?: string,
 		permissionMode?: string,
 		fastMode?: boolean,
+		agentProxy?: AgentProxySettings,
 	): Promise<AppServerContext> {
 		const binaryPath = this.codexBinPath;
+		const agentProxyKey = buildAgentProxyKey(agentProxy);
 		const existing = this.sessions.get(sessionId);
 		if (existing && !existing.server.killed) {
 			const existingBinaryPath = existing.binaryPath ?? binaryPath;
-			const decision = recycleContextIfStale(
+			const binaryDecision = recycleContextIfStale(
 				existing,
 				binaryPath,
 				existingBinaryPath,
@@ -1602,8 +1610,7 @@ export class CodexAppServerManager implements SessionManager {
 					this.clearPendingSessionState(sessionId);
 				},
 			);
-			if (decision === "keep") return existing;
-			if (decision === "defer") {
+			if (binaryDecision === "defer") {
 				logger.info("Codex binary changed; deferring recycle until turn ends", {
 					sessionId,
 					activeTurnId: existing.activeTurnId ?? "(none)",
@@ -1613,13 +1620,48 @@ export class CodexAppServerManager implements SessionManager {
 				return existing;
 			}
 
-			logger.info("Recycling idle Codex context after binary path change", {
-				sessionId,
-				providerThreadId: existing.providerThreadId ?? "(none)",
-				previous: existingBinaryPath,
-				next: binaryPath,
-			});
-			resume = resume ?? existing.providerThreadId ?? undefined;
+			if (binaryDecision === "recycled") {
+				logger.info("Recycling idle Codex context after binary path change", {
+					sessionId,
+					providerThreadId: existing.providerThreadId ?? "(none)",
+					previous: existingBinaryPath,
+					next: binaryPath,
+				});
+				resume = resume ?? existing.providerThreadId ?? undefined;
+			}
+
+			if (
+				binaryDecision === "keep" &&
+				existing.agentProxyKey === agentProxyKey
+			) {
+				return existing;
+			}
+
+			if (binaryDecision === "keep" && existing.activeTurnId) {
+				logger.info(
+					"Codex agent proxy changed; deferring recycle until turn ends",
+					{
+						sessionId,
+						activeTurnId: existing.activeTurnId,
+						previous: existing.agentProxyKey,
+						next: agentProxyKey,
+					},
+				);
+				return existing;
+			}
+
+			if (binaryDecision === "keep") {
+				logger.info("Recycling idle Codex context after agent proxy change", {
+					sessionId,
+					providerThreadId: existing.providerThreadId ?? "(none)",
+					previous: existing.agentProxyKey,
+					next: agentProxyKey,
+				});
+				resume = resume ?? existing.providerThreadId ?? undefined;
+				existing.server.kill();
+				this.sessions.delete(sessionId);
+				this.clearPendingSessionState(sessionId);
+			}
 		}
 
 		// Forward-reference holder so the `onRetry` closure can reach the
@@ -1632,6 +1674,7 @@ export class CodexAppServerManager implements SessionManager {
 			binaryPath,
 			cwd,
 			env: this.codexEnv,
+			agentProxy,
 			onNotification: () => {},
 			onRequest: () => {},
 			onExit: (code, signal) => {
@@ -1734,6 +1777,7 @@ export class CodexAppServerManager implements SessionManager {
 			activeEmitter: null,
 			notificationGate: null,
 			lastSentModel: model ?? "",
+			agentProxyKey,
 			lastRetryAt: null,
 			lastRetryNotice: null,
 			subAgentTracker: new SubAgentTracker(server),
@@ -1954,6 +1998,12 @@ function parseSkillsResponse(
 		if (!byName.has(command.name)) byName.set(command.name, command);
 	}
 	return Array.from(byName.values());
+}
+
+function buildAgentProxyKey(agentProxy?: AgentProxySettings): string {
+	if (!agentProxy) return "none";
+	if (agentProxy.mode === "system") return "system";
+	return `custom:${agentProxy.customUrl}`;
 }
 
 /**

@@ -54,6 +54,7 @@ import {
 	isNewSession,
 	resolveSessionSelectedModelId,
 } from "@/lib/workspace-helpers";
+import { publishShellEvent } from "@/shell/event-bus";
 import { CodexGoalBanner } from "../panel/codex-goal-banner";
 import type { AddDirPickerEntry } from "./editor/add-dir/typeahead-plugin";
 import { WorkspaceComposer } from "./index";
@@ -64,6 +65,7 @@ import {
 import type { PermissionPanelProps } from "./permission-panel";
 import type { StartSubmitMode } from "./start-submit-mode";
 import { SubmitQueueList } from "./submit-queue-list";
+import { TriageQuickActions } from "./triage-quick-actions";
 import type { UserInputResponseHandler } from "./user-input";
 
 const EMPTY_MODEL_SECTIONS: AgentModelSection[] = [];
@@ -140,6 +142,7 @@ type WorkspaceComposerContainerProps = {
 	restoreImages: string[];
 	restoreFiles: string[];
 	restoreCustomTags?: ComposerCustomTag[];
+	restoreEditorState?: SerializedEditorState | null;
 	restoreNonce: number;
 	pendingUserInput?: PendingUserInput | null;
 	onUserInputResponse?: UserInputResponseHandler;
@@ -203,6 +206,7 @@ type WorkspaceComposerContainerProps = {
 	queueItems?: readonly QueuedSubmit[];
 	onSteerQueued?: (itemId: string) => void;
 	onRemoveQueued?: (itemId: string) => void;
+	onEditQueued?: (itemId: string) => void;
 	contextPanelOpen?: boolean;
 	onToggleContextPanel?: () => void;
 	startSubmitMenu?: boolean;
@@ -243,6 +247,7 @@ export const WorkspaceComposerContainer = memo(
 		restoreImages,
 		restoreFiles,
 		restoreCustomTags = [],
+		restoreEditorState = null,
 		restoreNonce,
 		pendingUserInput = null,
 		onUserInputResponse = noopUserInputResponse,
@@ -268,6 +273,7 @@ export const WorkspaceComposerContainer = memo(
 		queueItems = EMPTY_QUEUE_ITEMS,
 		onSteerQueued,
 		onRemoveQueued,
+		onEditQueued,
 		contextPanelOpen = false,
 		onToggleContextPanel,
 		startSubmitMenu = false,
@@ -947,6 +953,34 @@ export const WorkspaceComposerContainer = memo(
 		const autoCloseHelpText =
 			"When enabled, action sessions will close automatically when finished.";
 
+		// Start/Dismiss quick actions for un-engaged triage workspaces. Dismiss reuses the sidebar controller's archive path.
+		const [triageGraduating, setTriageGraduating] = useState(false);
+		const [triageDismissing, setTriageDismissing] = useState(false);
+		useEffect(() => {
+			setTriageGraduating(false);
+			setTriageDismissing(false);
+		}, [displayedWorkspaceId]);
+
+		const isTriagePriming =
+			workspaceDetailQuery.data?.triagePrimingUnconsumed === true &&
+			!triageGraduating &&
+			!triageDismissing;
+
+		const handleTriageStart = useCallback(() => {
+			setTriageGraduating(true);
+			handleComposerSubmitInner("Go ahead.", [], [], []);
+		}, [handleComposerSubmitInner]);
+
+		const handleTriageDismiss = useCallback(() => {
+			if (!displayedWorkspaceId || triageDismissing) return;
+			setTriageDismissing(true);
+			// Delegates archive to the sidebar controller (one optimistic path).
+			publishShellEvent({
+				type: "request-archive-workspace",
+				workspaceId: displayedWorkspaceId,
+			});
+		}, [displayedWorkspaceId, triageDismissing]);
+
 		return (
 			// `z-20` lifts the entire composer stacking context above the thread
 			// viewport's `z-10` root (`thread-viewport.tsx:99`). Without this the
@@ -955,7 +989,13 @@ export const WorkspaceComposerContainer = memo(
 			// top edge, because the composer's `isolate` traps popup z-index
 			// inside a stacking context whose outer z defaults to `auto`.
 			<div className="relative isolate z-20 flex flex-col">
-				{isActionSession ? (
+				{isTriagePriming ? (
+					<TriageQuickActions
+						onStart={handleTriageStart}
+						onDismiss={handleTriageDismiss}
+						disabled={composerUnavailable || sending || triageDismissing}
+					/>
+				) : isActionSession ? (
 					<ActionRow
 						className={cn(
 							"relative z-0 mx-auto -mb-px w-[90%] rounded-t-2xl border-b-0",
@@ -1031,6 +1071,7 @@ export const WorkspaceComposerContainer = memo(
 							items={queueItems}
 							onSteer={(id) => onSteerQueued?.(id)}
 							onRemove={(id) => onRemoveQueued?.(id)}
+							onEdit={(id) => onEditQueued?.(id)}
 							disabled={composerUnavailable}
 						/>
 					</div>
@@ -1077,6 +1118,7 @@ export const WorkspaceComposerContainer = memo(
 						restoreImages={restoreImages}
 						restoreFiles={restoreFiles}
 						restoreCustomTags={restoreCustomTags}
+						restoreEditorState={restoreEditorState}
 						restoreNonce={restoreNonce}
 						pendingUserInput={pendingUserInput}
 						onUserInputResponse={onUserInputResponse}

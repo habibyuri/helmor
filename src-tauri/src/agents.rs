@@ -219,13 +219,36 @@ pub async fn list_cursor_models(
 pub async fn send_agent_message_stream(
     app: AppHandle,
     sidecar: tauri::State<'_, crate::sidecar::ManagedSidecar>,
-    request: AgentSendRequest,
+    mut request: AgentSendRequest,
     on_event: Channel<AgentStreamEvent>,
 ) -> CmdResult<()> {
     let prompt = request.prompt.trim().to_string();
     if prompt.is_empty() {
         return Err(anyhow::anyhow!("Prompt cannot be empty.").into());
     }
+
+    // Inject triage priming as a hidden prefix; consumed flag flips only after sidecar accepts.
+    let priming_session_to_consume: Option<String> = match request.helmor_session_id.as_deref() {
+        Some(session_id) => match crate::triage::load_priming_prefix_for_session(session_id) {
+            Ok(Some(priming_prefix)) => {
+                request.prompt_prefix = crate::triage::combine_prefixes(
+                    Some(priming_prefix),
+                    request.prompt_prefix.take(),
+                );
+                Some(session_id.to_string())
+            }
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    session_id,
+                    "triage: load_priming_prefix_for_session failed"
+                );
+                None
+            }
+        },
+        None => None,
+    };
 
     let model = resolve_model(&request.model_id, Some(request.provider.as_str()));
 
@@ -242,7 +265,7 @@ pub async fn send_agent_message_stream(
     let stream_id = Uuid::new_v4().to_string();
     let active_streams = app.state::<ActiveStreams>();
 
-    stream_via_sidecar(
+    let send_result = stream_via_sidecar(
         app.clone(),
         on_event,
         &sidecar,
@@ -252,7 +275,32 @@ pub async fn send_agent_message_stream(
         &prompt,
         &request,
         &working_directory,
-    )
+    );
+
+    // Mark consumed only after the prompt actually streamed; retries should keep the priming.
+    if send_result.is_ok() {
+        if let Some(session_id) = priming_session_to_consume {
+            match crate::triage::mark_consumed_for_session(&session_id) {
+                Ok(true) => {
+                    // Publish so the sidebar repaints the kind flip immediately.
+                    crate::ui_sync::publish(
+                        &app,
+                        crate::ui_sync::UiMutationEvent::WorkspaceListChanged,
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        session_id,
+                        "triage: failed to mark priming consumed; injection will recur"
+                    );
+                }
+            }
+        }
+    }
+
+    send_result
 }
 
 fn resolve_stream_working_directory(

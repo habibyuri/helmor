@@ -77,6 +77,10 @@ pub struct WorkspaceSidebarRow {
     pub created_at: String,
     pub updated_at: String,
     pub last_user_message_at: Option<String>,
+    /// "manual" or "ai_triage" — routes ai_triage rows into the Triage group.
+    pub kind: String,
+    /// True while an ai_triage row still needs the user's first send.
+    pub triage_priming_unconsumed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -177,6 +181,8 @@ pub struct WorkspaceDetail {
     /// (either fresh or because the previously-active id no longer
     /// exists; the frontend re-renders against the first item).
     pub active_run_action_id: Option<String>,
+    /// Drives the composer's Start/Dismiss row; flips on first user send via `mark_consumed_for_session`.
+    pub triage_priming_unconsumed: bool,
 }
 
 // Workspace persistence lives in `crate::models::workspaces`.
@@ -184,6 +190,7 @@ pub struct WorkspaceDetail {
 // ---- Sidebar groups ----
 
 pub fn list_workspace_groups() -> Result<Vec<WorkspaceSidebarGroup>> {
+    let mut ai_tasks = Vec::new();
     let mut pinned = Vec::new();
     let mut chats = Vec::new();
     let mut done = Vec::new();
@@ -197,17 +204,18 @@ pub fn list_workspace_groups() -> Result<Vec<WorkspaceSidebarGroup>> {
     // each group naturally inherits the same stable order, no per-group
     // re-sort needed.
     //
-    // Chat workspaces live in their own bucket and don't participate in
-    // status/pinned buckets — their `status` column is meaningless
-    // (kept at the default `in-progress` for column compatibility).
+    // Chat and AI-triage workspaces live in their own buckets, separate from status/pinned.
     for record in workspace_models::load_workspace_records()? {
         if record.state == WorkspaceState::Archived {
             continue;
         }
         let is_chat = record.mode == WorkspaceMode::Chat;
         let is_pinned = record.pinned_at.is_some();
+        let is_ai_triage = record.kind == "ai_triage";
         let row = record_to_sidebar_row(record);
-        if is_chat {
+        if is_ai_triage {
+            ai_tasks.push(row);
+        } else if is_chat {
             chats.push(row);
         } else if is_pinned {
             pinned.push(row);
@@ -223,6 +231,12 @@ pub fn list_workspace_groups() -> Result<Vec<WorkspaceSidebarGroup>> {
     }
 
     Ok(vec![
+        WorkspaceSidebarGroup {
+            id: "ai-tasks".to_string(),
+            label: "Proposed tasks".to_string(),
+            tone: "ai-tasks".to_string(),
+            rows: ai_tasks,
+        },
         WorkspaceSidebarGroup {
             id: "pinned".to_string(),
             label: "Pinned".to_string(),
@@ -1284,6 +1298,8 @@ pub fn record_to_sidebar_row(record: WorkspaceRecord) -> WorkspaceSidebarRow {
         created_at: record.created_at,
         updated_at: record.updated_at,
         last_user_message_at: record.last_user_message_at,
+        triage_priming_unconsumed: record.kind == "ai_triage" && !record.ai_priming_consumed,
+        kind: record.kind,
     }
 }
 
@@ -1385,6 +1401,7 @@ pub fn record_to_detail(record: WorkspaceRecord) -> WorkspaceDetail {
         forge_login: record.forge_login,
         setup_completed_at: record.setup_completed_at,
         active_run_action_id: record.active_run_action_id,
+        triage_priming_unconsumed: record.kind == "ai_triage" && !record.ai_priming_consumed,
     }
 }
 

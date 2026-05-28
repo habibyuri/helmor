@@ -41,7 +41,11 @@ import {
 	useQuickSwitch,
 	WorkspaceMruStack,
 } from "@/features/quick-switch";
-import { SettingsDialog, type SettingsSection } from "@/features/settings";
+import {
+	type ContextProviderTab,
+	SettingsDialog,
+	type SettingsSection,
+} from "@/features/settings";
 import { getShortcut } from "@/features/shortcuts/registry";
 import {
 	type ShortcutHandler,
@@ -152,6 +156,8 @@ function MainApp() {
 	>(null);
 	const [settingsInitialSection, setSettingsInitialSection] =
 		useState<SettingsSection>();
+	const [settingsInitialInboxProvider, setSettingsInitialInboxProvider] =
+		useState<ContextProviderTab | undefined>();
 	const [queryClient] = useState(() => createHelmorQueryClient());
 	const preloadSettings = useMemo<AppSettings>(
 		() => getPreloadedSettings(),
@@ -174,6 +180,7 @@ function MainApp() {
 	);
 	useShellEvent("open-settings", (event) => {
 		setSettingsInitialSection(event.section);
+		setSettingsInitialInboxProvider(event.inboxProvider);
 		setSettingsWorkspaceId(null);
 		setSettingsWorkspaceRepoId(null);
 		setSettingsOpen(true);
@@ -283,6 +290,7 @@ function MainApp() {
 					workspaceId={settingsWorkspaceId}
 					workspaceRepoId={settingsWorkspaceRepoId}
 					initialSection={settingsInitialSection}
+					initialInboxProvider={settingsInitialInboxProvider}
 					onClose={() => {
 						setSettingsOpen(false);
 						void queryClient.invalidateQueries({
